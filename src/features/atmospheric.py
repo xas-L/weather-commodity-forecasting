@@ -121,50 +121,140 @@ def extract_t850(ds: xr.Dataset) -> xr.DataArray:
     return t850
 
 
-def compute_z500_anomaly(z500: xr.DataArray) -> xr.DataArray:
+def compute_z500_climatology(z500: xr.DataArray) -> xr.DataArray:
+    """
+    Computes the day-of-year climatological mean of the Z500 field.
+
+    This should be called on the training-period dataset only and the result
+    stored for reuse when computing anomalies over the full dataset. Fitting
+    the climatology on training data alone prevents test-period observations
+    from influencing the baseline that features are measured against.
+
+    Parameters
+    ----------
+    z500:
+        Z500 field in geopotential metres covering the training period only,
+        as returned by extract_z500.
+
+    Returns
+    -------
+    xr.DataArray
+        Day-of-year climatological mean, indexed by dayofyear (1–366).
+    """
+    climatology = z500.groupby("time.dayofyear").mean("time")
+    climatology.attrs["long_name"] = "500 hPa Geopotential Height Climatology (training period)"
+    return climatology
+
+
+def compute_t850_climatology(t850: xr.DataArray) -> xr.DataArray:
+    """
+    Computes the day-of-year climatological mean of the T850 field.
+
+    Should be called on the training-period dataset only. See
+    compute_z500_climatology for the rationale.
+
+    Parameters
+    ----------
+    t850:
+        T850 field in degrees Celsius covering the training period only,
+        as returned by extract_t850.
+
+    Returns
+    -------
+    xr.DataArray
+        Day-of-year climatological mean, indexed by dayofyear (1–366).
+    """
+    climatology = t850.groupby("time.dayofyear").mean("time")
+    climatology.attrs["long_name"] = "850 hPa Temperature Climatology (training period)"
+    return climatology
+
+
+def compute_z500_anomaly(
+    z500: xr.DataArray,
+    train_climatology: Optional[xr.DataArray] = None,
+) -> xr.DataArray:
     """
     Removes the day-of-year climatological mean from the Z500 field to produce
-    standardised anomalies.
+    anomalies.
 
-    The climatology is computed as the multi-year mean for each calendar day
-    across the entire time dimension of the input array. The anomaly field
-    isolates the dynamically meaningful departures from the seasonal cycle,
-    which are the signals that carry subseasonal predictability.
+    The climatology is computed from the training period only when
+    train_climatology is supplied. This is the correct approach when computing
+    features for a walk-forward or hold-out evaluation: the anomaly baseline
+    must not be contaminated by observations from the test window.
+
+    If train_climatology is None the climatology is estimated from the input
+    array itself. This is acceptable only when the full input array is the
+    training set (e.g. during an initial exploratory run), and will introduce
+    leakage if the input spans both train and test periods.
 
     Parameters
     ----------
     z500:
         Z500 field in geopotential metres, as returned by extract_z500.
+    train_climatology:
+        Day-of-year climatological mean computed from the training period only,
+        as returned by compute_z500_climatology. Strongly recommended for all
+        evaluation workflows. Pass None only for exploratory work on training
+        data alone.
 
     Returns
     -------
     xr.DataArray
         Z500 anomaly in geopotential metres, same dimensions as input.
     """
-    climatology = z500.groupby("time.dayofyear").mean("time")
-    anomaly     = z500.groupby("time.dayofyear") - climatology
+    if train_climatology is not None:
+        climatology = train_climatology
+    else:
+        logger.warning(
+            "compute_z500_anomaly: no train_climatology supplied. Climatology will "
+            "be estimated from the full input array. This introduces forward-looking "
+            "bias if the input spans both training and test periods."
+        )
+        climatology = z500.groupby("time.dayofyear").mean("time")
+
+    anomaly = z500.groupby("time.dayofyear") - climatology
     anomaly.attrs["long_name"] = "500 hPa Geopotential Height Anomaly"
     return anomaly
 
 
-def compute_t850_anomaly(t850: xr.DataArray) -> xr.DataArray:
+def compute_t850_anomaly(
+    t850: xr.DataArray,
+    train_climatology: Optional[xr.DataArray] = None,
+) -> xr.DataArray:
     """
     Removes the day-of-year climatological mean from the T850 field.
-    The anomaly quantifies whether the mid-troposphere air mass over
-    a given region is warmer or colder than the seasonal expectation.
+
+    The anomaly quantifies whether the mid-troposphere air mass over a given
+    region is warmer or colder than the seasonal expectation.
+
+    The train_climatology parameter should always be supplied in evaluation
+    workflows. See compute_z500_anomaly for the full rationale.
 
     Parameters
     ----------
     t850:
         T850 field in degrees Celsius, as returned by extract_t850.
+    train_climatology:
+        Day-of-year climatological mean computed from the training period only,
+        as returned by compute_t850_climatology. Strongly recommended for all
+        evaluation workflows.
 
     Returns
     -------
     xr.DataArray
         T850 anomaly in degrees Celsius, same dimensions as input.
     """
-    climatology = t850.groupby("time.dayofyear").mean("time")
-    anomaly     = t850.groupby("time.dayofyear") - climatology
+    if train_climatology is not None:
+        climatology = train_climatology
+    else:
+        logger.warning(
+            "compute_t850_anomaly: no train_climatology supplied. Climatology will "
+            "be estimated from the full input array. This introduces forward-looking "
+            "bias if the input spans both training and test periods."
+        )
+        climatology = t850.groupby("time.dayofyear").mean("time")
+
+    anomaly = t850.groupby("time.dayofyear") - climatology
     anomaly.attrs["long_name"] = "850 hPa Temperature Anomaly"
     return anomaly
 
@@ -340,7 +430,10 @@ def compute_jet_stream_index(ds: xr.Dataset) -> pd.DataFrame:
     return df
 
 
-def compute_wind_shear(ds: xr.Dataset, region_bounds: Optional[dict] = None) -> pd.Series:
+def compute_wind_shear(
+    ds: xr.Dataset,
+    region_bounds: Optional[dict] = None,
+) -> pd.Series:
     """
     Computes area-mean vertical wind shear between 300 hPa and 850 hPa as
     the difference in zonal wind between those two levels.
@@ -502,6 +595,7 @@ def add_blocking_persistence(
 
 def build_atmospheric_features(
     ds_pressure: xr.Dataset,
+    train_ds_pressure: Optional[xr.Dataset] = None,
     include_jet: bool = True,
     include_shear: bool = True,
 ) -> pd.DataFrame:
@@ -511,11 +605,27 @@ def build_atmospheric_features(
     index series, and assembles them into a wide DataFrame ready for merging with
     surface and demand features.
 
+    The train_ds_pressure parameter should always be supplied in evaluation
+    workflows. When provided, day-of-year climatologies for Z500 and T850 are
+    estimated from the training period only, ensuring that anomaly features for
+    the test window are not contaminated by test-period observations.
+
+    Typical usage in the feature engineering notebook:
+
+        # Fit climatologies on training data
+        train_ds = ds_pressure.sel(time=slice("2018", "2021"))
+        feat_df  = build_atmospheric_features(ds_pressure, train_ds_pressure=train_ds)
+
     Parameters
     ----------
     ds_pressure:
-        ERA5 pressure-level xarray Dataset, as returned by
-        era5_pipeline.load_pressure_dataset.
+        ERA5 pressure-level xarray Dataset spanning the full period (train + test),
+        as returned by era5_pipeline.load_pressure_dataset.
+    train_ds_pressure:
+        ERA5 pressure-level xarray Dataset covering the training period only.
+        Used to compute Z500 and T850 day-of-year climatologies. If None, the
+        climatology is computed from the full ds_pressure input, which will
+        introduce forward-looking bias if ds_pressure spans the test period.
     include_jet:
         If True, compute jet stream position and speed features. Requires
         300 hPa zonal wind in the dataset.
@@ -528,10 +638,27 @@ def build_atmospheric_features(
     pd.DataFrame
         Wide UTC-indexed DataFrame containing all atmospheric index features.
     """
-    z500      = extract_z500(ds_pressure)
-    z500_anom = compute_z500_anomaly(z500)
-    t850      = extract_t850(ds_pressure)
-    t850_anom = compute_t850_anomaly(t850)
+    # Extract fields from the full dataset
+    z500 = extract_z500(ds_pressure)
+    t850 = extract_t850(ds_pressure)
+
+    # Compute climatologies from training period only when supplied
+    if train_ds_pressure is not None:
+        z500_train      = extract_z500(train_ds_pressure)
+        t850_train      = extract_t850(train_ds_pressure)
+        z500_clim       = compute_z500_climatology(z500_train)
+        t850_clim       = compute_t850_climatology(t850_train)
+    else:
+        logger.warning(
+            "build_atmospheric_features: train_ds_pressure not supplied. "
+            "Climatologies will be fitted on the full input dataset. "
+            "Supply train_ds_pressure to avoid forward-looking bias in anomaly features."
+        )
+        z500_clim = None
+        t850_clim = None
+
+    z500_anom = compute_z500_anomaly(z500, train_climatology=z500_clim)
+    t850_anom = compute_t850_anomaly(t850, train_climatology=t850_clim)
 
     nao_proxy = compute_nao_z500_proxy(z500_anom)
     blocking  = compute_greenland_blocking_index(z500_anom)
