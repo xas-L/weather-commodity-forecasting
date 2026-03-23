@@ -97,35 +97,87 @@ def compute_daily_degree_days(
     return compute_degree_days(daily_mean, base_temp=base_temp)
 
 
+def fit_hdd_climatology(degree_days: pd.DataFrame) -> dict[str, pd.Series]:
+    """
+    Computes the day-of-year mean HDD and CDD from a degree-day DataFrame.
+
+    This should be called on the training period only and the result passed to
+    add_climatological_anomaly for both the training and test windows. Fitting
+    the climatology on training data alone prevents test-period observations
+    from contaminating the anomaly baseline.
+
+    Typical usage:
+
+        train_dd = build_degree_day_features(t2m_train)
+        clim     = fit_hdd_climatology(train_dd)
+
+        train_feat = build_degree_day_features(t2m_train, climatology=clim)
+        test_feat  = build_degree_day_features(t2m_test,  climatology=clim)
+
+    Parameters
+    ----------
+    degree_days:
+        DataFrame containing 'HDD' and 'CDD' columns covering the training
+        period only, as returned by compute_degree_days or
+        compute_daily_degree_days.
+
+    Returns
+    -------
+    dict[str, pd.Series]
+        Dictionary with keys 'HDD' and 'CDD', each mapping to a Series whose
+        index is the integer day-of-year (1–366) and whose values are the
+        training-period mean for that day.
+    """
+    df = degree_days.copy()
+    df["doy"] = df.index.dayofyear
+
+    clim: dict[str, pd.Series] = {}
+    for col in ["HDD", "CDD"]:
+        if col not in df.columns:
+            logger.warning(
+                "fit_hdd_climatology: column '%s' not found, skipping.", col
+            )
+            continue
+        clim[col] = df.groupby("doy")[col].mean()
+
+    return clim
+
+
 def add_climatological_anomaly(
     degree_days: pd.DataFrame,
-    lookback_years: int = 5,
+    climatology: Optional[dict[str, pd.Series]] = None,
 ) -> pd.DataFrame:
     """
     Computes the deviation of each day's HDD and CDD from its day-of-year
-    climatological mean over a rolling historical window.
+    climatological mean.
 
     The anomaly is what a gas trader actually cares about. A day with HDD of
     8 in mid-January is unremarkable. A day with HDD of 8 in late March is
     a significant cold anomaly and implies above-seasonal gas burn.
 
-    The climatology is computed using only data prior to each observation to
-    avoid any forward-looking bias in features used for backtesting.
+    When climatology is supplied it must have been fitted on the training period
+    only, via fit_hdd_climatology. This prevents test-period observations from
+    influencing the anomaly baseline. If climatology is None, the mean is
+    estimated from the input DataFrame itself, which is only valid when that
+    DataFrame is the training set.
 
     Parameters
     ----------
     degree_days:
         DataFrame containing 'HDD' and 'CDD' columns, as returned by
         compute_degree_days or compute_daily_degree_days.
-    lookback_years:
-        Number of full years of history used to compute the day-of-year mean.
-        A minimum of 3 years is recommended for a stable climatology.
+    climatology:
+        Pre-fitted day-of-year climatology as returned by fit_hdd_climatology.
+        Should always be supplied in evaluation workflows. When None, the mean
+        is estimated from the input DataFrame — acceptable for training data
+        only, and will introduce forward-looking bias if the input spans the
+        test period.
 
     Returns
     -------
     pd.DataFrame
         Input DataFrame with additional columns 'HDD_anom' and 'CDD_anom'
-        representing the signed deviation from climatological mean.
+        representing the signed deviation from the climatological mean.
     """
     df = degree_days.copy()
     df["doy"] = df.index.dayofyear
@@ -135,11 +187,19 @@ def add_climatological_anomaly(
             logger.warning("Column '%s' not found, skipping anomaly computation.", col)
             continue
 
-        clim_mean = (
-            df[col]
-            .groupby(df["doy"])
-            .transform("mean")
-        )
+        if climatology is not None and col in climatology:
+            clim_mean = df["doy"].map(climatology[col])
+        else:
+            if climatology is None:
+                logger.warning(
+                    "add_climatological_anomaly: no climatology supplied for '%s'. "
+                    "Mean will be estimated from the input DataFrame. This introduces "
+                    "forward-looking bias if the input spans both training and test "
+                    "periods. Supply climatology from fit_hdd_climatology to avoid this.",
+                    col,
+                )
+            clim_mean = df.groupby("doy")[col].transform("mean")
+
         df[anom_col] = df[col] - clim_mean
 
     df = df.drop(columns=["doy"])
@@ -254,7 +314,8 @@ def add_seasonal_position(degree_days: pd.DataFrame) -> pd.DataFrame:
     Returns
     -------
     pd.DataFrame
-        Input DataFrame with 'gas_year_position' and 'gas_year_sin' columns.
+        Input DataFrame with 'gas_year_position', 'gas_year_sin', and
+        'gas_year_cos' columns.
     """
     df = degree_days.copy()
 
@@ -313,6 +374,7 @@ def compute_weekly_hdd_forecast_error(
 def build_degree_day_features(
     t2m_hourly: pd.Series,
     base_temp: float = BASE_TEMP_EUROPEAN,
+    climatology: Optional[dict[str, pd.Series]] = None,
     rolling_windows: Optional[list[int]] = None,
     anomaly_windows: Optional[list[int]] = None,
 ) -> pd.DataFrame:
@@ -324,12 +386,21 @@ def build_degree_day_features(
     This is the primary entry point for the feature engineering notebook and
     for the model training pipeline.
 
+    The climatology parameter should always be supplied in evaluation workflows
+    so that the anomaly baseline is fixed on training data. Fit it once via
+    fit_hdd_climatology on the training period, then pass the result here for
+    both training and test feature construction.
+
     Parameters
     ----------
     t2m_hourly:
         Hourly 2m temperature in degrees Celsius, UTC-indexed.
     base_temp:
         Base temperature in degrees Celsius for degree-day calculation.
+    climatology:
+        Pre-fitted day-of-year climatology as returned by fit_hdd_climatology.
+        If None, the mean is estimated from the input data. Acceptable for
+        training data only; introduces forward-looking bias for test data.
     rolling_windows:
         Window lengths for raw HDD/CDD rolling sums. Passed to
         add_rolling_accumulations.
@@ -343,7 +414,7 @@ def build_degree_day_features(
         Daily-indexed DataFrame with the full degree-day feature set.
     """
     df = compute_daily_degree_days(t2m_hourly, base_temp=base_temp)
-    df = add_climatological_anomaly(df)
+    df = add_climatological_anomaly(df, climatology=climatology)
     df = add_rolling_accumulations(df, windows=rolling_windows)
     df = add_anomaly_accumulations(df, windows=anomaly_windows)
     df = add_seasonal_position(df)
