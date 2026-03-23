@@ -39,17 +39,17 @@ logger = logging.getLogger(__name__)
 # Thresholds for regime classification in units of standard deviations.
 # These are conventional values used in the atmospheric science literature.
 # Cold and warm events are defined symmetrically to produce balanced classes.
-REGIME_COLD_THRESHOLD:   float = -0.8
-REGIME_WARM_THRESHOLD:   float =  0.8
-BLOCKING_THRESHOLD:      float = -1.5
-STRONG_WESTERLY_THRESHOLD: float = 1.5
+REGIME_COLD_THRESHOLD:     float = -0.8
+REGIME_WARM_THRESHOLD:     float =  0.8
+BLOCKING_THRESHOLD:        float = -1.5
+STRONG_WESTERLY_THRESHOLD: float =  1.5
 
 # Lead times in days for which lagged index values are constructed.
 # Week-2 and week-4 leads correspond to the target forecast horizons.
 SUBSEASONAL_LAGS: list[int] = [7, 10, 14, 21, 28]
 
 # ENSO phase thresholds in degrees Celsius anomaly for the Nino 3.4 region.
-ENSO_WARM_THRESHOLD: float = 0.5    # El Nino
+ENSO_WARM_THRESHOLD: float =  0.5   # El Nino
 ENSO_COLD_THRESHOLD: float = -0.5   # La Nina
 
 
@@ -259,8 +259,8 @@ def compute_persistence_features(
         return binary.groupby(not_active).cumcount() * binary
 
     frames = {
-        f"{name}_in_cold_phase": in_cold,
-        f"{name}_in_warm_phase": in_warm,
+        f"{name}_in_cold_phase":    in_cold,
+        f"{name}_in_warm_phase":    in_warm,
         f"{name}_cold_consec_days": consecutive_days(in_cold),
         f"{name}_warm_consec_days": consecutive_days(in_warm),
     }
@@ -317,14 +317,14 @@ def compute_phase_coupling(
     frames = {}
 
     # Linear product captures simultaneous exceedance better than each index alone
-    frames["nao_ao_product"]     = aligned["nao"] * aligned["ao"]
-    frames["nao_ao_both_cold"]   = (
+    frames["nao_ao_product"]   = aligned["nao"] * aligned["ao"]
+    frames["nao_ao_both_cold"] = (
         (aligned["nao"] < REGIME_COLD_THRESHOLD) & (aligned["ao"] < REGIME_COLD_THRESHOLD)
     ).astype(int)
-    frames["nao_ao_both_warm"]   = (
+    frames["nao_ao_both_warm"] = (
         (aligned["nao"] > REGIME_WARM_THRESHOLD) & (aligned["ao"] > REGIME_WARM_THRESHOLD)
     ).astype(int)
-    frames["nao_ao_opposing"]    = (
+    frames["nao_ao_opposing"]  = (
         (aligned["nao"] * aligned["ao"]) < 0
     ).astype(int)
 
@@ -344,11 +344,63 @@ def compute_phase_coupling(
     return pd.DataFrame(frames, index=aligned.index)
 
 
+def fit_weekly_temperature_climatology(
+    t2m_weekly: pd.Series,
+) -> tuple[pd.Series, float]:
+    """
+    Computes the ISO week-of-year mean and the rolling standard deviation of a
+    weekly temperature series from the training period.
+
+    This should be called on training data only and the results passed to
+    build_subseasonal_target for both training and test target construction.
+    Fitting on training data alone prevents the standardisation from being
+    contaminated by test-period observations.
+
+    Typical usage:
+
+        clim_mean, clim_std = fit_weekly_temperature_climatology(t2m_weekly_train)
+        target_train = build_subseasonal_target(t2m_weekly_train,
+                                               train_clim_mean=clim_mean,
+                                               train_clim_std=clim_std)
+        target_test  = build_subseasonal_target(t2m_weekly_test,
+                                               train_clim_mean=clim_mean,
+                                               train_clim_std=clim_std)
+
+    Parameters
+    ----------
+    t2m_weekly:
+        Weekly mean 2m temperature in degrees Celsius, UTC-indexed, covering
+        the training period only.
+
+    Returns
+    -------
+    tuple[pd.Series, float]
+        A tuple of:
+            clim_mean: Series mapping ISO week number (1–53) to training-period
+                       mean temperature for that week.
+            clim_std:  Scalar standard deviation of the full training series,
+                       used for normalising weekly anomalies.
+    """
+    iso_week = t2m_weekly.index.isocalendar().week.astype(int)
+    clim_mean = t2m_weekly.groupby(iso_week).mean()
+    clim_std  = float(t2m_weekly.std())
+
+    if clim_std == 0.0:
+        raise ValueError(
+            "Training temperature series has zero standard deviation. "
+            "Cannot compute normalised anomalies."
+        )
+
+    return clim_mean, clim_std
+
+
 def build_subseasonal_target(
     t2m_weekly: pd.Series,
     lead_weeks: int = 2,
     cold_threshold_sd: float = REGIME_COLD_THRESHOLD,
     warm_threshold_sd: float = REGIME_WARM_THRESHOLD,
+    train_clim_mean: Optional[pd.Series] = None,
+    train_clim_std: Optional[float] = None,
 ) -> pd.Series:
     """
     Constructs the target variable for the subseasonal regime classifier.
@@ -357,8 +409,16 @@ def build_subseasonal_target(
     in a given week, shifted forward by the lead time so that features at time t
     are paired with the regime at time t + lead_weeks.
 
-    Weekly temperature anomaly is standardised using a rolling 5-year standard
-    deviation to account for the year-to-year variability in weekly temperatures.
+    When train_clim_mean and train_clim_std are supplied they must have been
+    fitted on the training period only, via fit_weekly_temperature_climatology.
+    This ensures that the anomaly standardisation applied to test-period weeks
+    uses a baseline that does not incorporate any test observations. Supplying
+    these parameters is strongly recommended for all evaluation workflows.
+
+    If either parameter is None, the mean and standard deviation are estimated
+    from the input series itself. This is acceptable when the input is the
+    training set, but will introduce forward-looking bias if the input spans
+    the test period.
 
     Parameters
     ----------
@@ -371,6 +431,14 @@ def build_subseasonal_target(
         Standard deviation threshold for cold regime classification.
     warm_threshold_sd:
         Standard deviation threshold for warm regime classification.
+    train_clim_mean:
+        ISO week-of-year mean temperatures fitted on the training period only,
+        as returned by fit_weekly_temperature_climatology. If None, the mean is
+        computed from the input series.
+    train_clim_std:
+        Scalar standard deviation fitted on the training period only, as returned
+        by fit_weekly_temperature_climatology. If None, the std is computed from
+        the input series.
 
     Returns
     -------
@@ -379,11 +447,37 @@ def build_subseasonal_target(
         the label at each index position corresponds to the regime that will
         occur lead_weeks later.
     """
-    # Compute weekly climatology and standardised anomaly
-    clim_mean = t2m_weekly.groupby(t2m_weekly.index.isocalendar().week).transform("mean")
-    clim_std  = t2m_weekly.rolling(52 * 3, min_periods=52).std()
+    iso_week = t2m_weekly.index.isocalendar().week.astype(int)
 
-    anom_sd = (t2m_weekly - clim_mean) / clim_std.replace(0, np.nan)
+    if train_clim_mean is not None:
+        # Map each observation's ISO week to its training-period mean
+        clim_mean = iso_week.map(train_clim_mean).values
+        clim_mean = pd.Series(clim_mean, index=t2m_weekly.index)
+    else:
+        logger.warning(
+            "build_subseasonal_target: train_clim_mean not supplied. Weekly mean "
+            "will be estimated from the input series. This introduces forward-looking "
+            "bias if the input spans both training and test periods. Supply "
+            "train_clim_mean from fit_weekly_temperature_climatology to avoid this."
+        )
+        clim_mean = t2m_weekly.groupby(iso_week).transform("mean")
+
+    if train_clim_std is not None:
+        clim_std = train_clim_std
+    else:
+        logger.warning(
+            "build_subseasonal_target: train_clim_std not supplied. Standard "
+            "deviation will be estimated from the input series. This introduces "
+            "forward-looking bias if the input spans both training and test periods."
+        )
+        clim_std = float(t2m_weekly.rolling(52 * 3, min_periods=52).std().median())
+
+    if clim_std == 0.0:
+        raise ValueError(
+            "Climatological standard deviation is zero. Cannot standardise anomalies."
+        )
+
+    anom_sd = (t2m_weekly - clim_mean) / clim_std
 
     regime = classify_nao_regime(
         anom_sd,
